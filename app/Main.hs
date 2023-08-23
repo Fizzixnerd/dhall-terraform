@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main
   ( main,
@@ -8,13 +9,16 @@ where
 import Control.Concurrent.Async (mapConcurrently_)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy as B
-import Data.Map.Strict (Map, (!))
+import Data.Map.Strict (Map, (!?), keys)
 import Data.List.NonEmpty(NonEmpty(..))
 import qualified Data.Map.Strict as M
-import Data.Maybe (fromJust, fromMaybe)
-import Data.Text (Text, pack)
-import qualified Data.Text.Prettyprint.Doc as Pretty
-import qualified Data.Text.Prettyprint.Doc.Render.Text as PrettyText
+import Data.Maybe (fromMaybe)
+import Data.Text (Text, pack, unpack)
+import Control.Exception (throwIO, catch)
+import GHC.IO.Handle()
+import GHC.IO.StdHandles()
+import qualified Prettyprinter as Pretty
+import qualified Prettyprinter.Render.Text as PrettyText
 import Data.Version (showVersion)
 import qualified Dhall.Core as Dhall
 import Dhall.Format (Format (..), format)
@@ -27,6 +31,8 @@ import Terraform.Convert
 import Terraform.Types
 import Turtle ((</>))
 import qualified Turtle
+import Prelude hiding (writeFile)
+import Data.Text.IO (writeFile)
 
 -- | Pretty print dhall expressions.
 pretty :: Pretty.Pretty a => a -> Text
@@ -43,29 +49,47 @@ readSchemaFile f = do
     Left e -> error e
     Right d -> pure d
 
-getResources :: Text -> ProviderSchemaRepr -> Map Text SchemaRepr
-getResources name schema = fromJust $ _resourceSchemas (_providerSchemas schema ! name)
+getProviderSchemaDataOrError :: Text -> ProviderSchemaRepr -> IO ProviderSchemaData
+getProviderSchemaDataOrError providerKey schemaRepr = do
+  let actualProviderKey = unpack (head (keys (_providerSchemas schemaRepr)))
+  case _providerSchemas schemaRepr !? providerKey of
+    Just providerSchemaData -> return providerSchemaData
+    Nothing -> throwIO(MissingProviderSchema (unpack providerKey) actualProviderKey)
 
-getProvider :: Text -> ProviderSchemaRepr -> Map Text SchemaRepr
-getProvider name schema =
-  let provider = fromJust $ _provider (_providerSchemas schema ! name)
-   in M.fromList [("provider", provider)]
+getProvider :: Text -> ProviderSchemaRepr -> IO (Map Text SchemaRepr)
+getProvider providerSchemaKey schemaRepr = do
+  providerSchemaData <- getProviderSchemaDataOrError providerSchemaKey schemaRepr
+  provider <- case _provider providerSchemaData of
+          Just schemaReprMap -> return schemaReprMap
+          Nothing -> throwIO (MissingProvider (unpack providerSchemaKey))
+  return (M.fromList [("provider", provider)])
 
-getDataSources :: Text -> ProviderSchemaRepr -> Map Text SchemaRepr
-getDataSources name schema = fromJust $ _dataSourceSchemas (_providerSchemas schema ! name)
+getResources :: Text -> ProviderSchemaRepr -> IO (Map Text SchemaRepr)
+getResources resourcesKey schemaRepr = do
+  providerSchemaData <- getProviderSchemaDataOrError resourcesKey schemaRepr
+  case _resourceSchemas providerSchemaData of
+    Just schemaReprMap -> return schemaReprMap
+    Nothing -> throwIO (MissingResources (unpack resourcesKey))
+
+getDataSources :: Text -> ProviderSchemaRepr -> IO (Map Text SchemaRepr)
+getDataSources dataSourcesKey schemaRepr = do
+  providerSchemaData <- getProviderSchemaDataOrError dataSourcesKey schemaRepr
+  case _dataSourceSchemas providerSchemaData of
+    Just schemaReprMap -> return schemaReprMap
+    Nothing -> throwIO (MissingData (unpack dataSourcesKey))
 
 -- | Write and format a Dhall expression to a file
 writeDhall :: Turtle.FilePath -> Expr -> IO ()
 writeDhall filepath expr = do
-  putStrLn $ "Writing file '" <> Turtle.encodeString filepath <> "'"
-  Turtle.writeTextFile filepath $ pretty expr <> "\n"
+  putStrLn $ "Writing file '" <> filepath <> "'"
+  writeFile filepath $ pretty expr <> "\n"
   format
     ( Format
         { chosenCharacterSet = Just Dhall.Pretty.Unicode,
           censor = Dhall.Util.NoCensor,
           outputMode = Dhall.Util.Write,
           transitivity = Dhall.Util.Transitive,
-          inputs = Dhall.Util.InputFile (Turtle.encodeString filepath) :| []
+          inputs = Dhall.Util.InputFile filepath :| []
         }
     )
 
@@ -84,7 +108,7 @@ type ProviderType = Text
 -- | Generate a completion record for the resource.
 mkRecord :: TFType -> Turtle.FilePath -> ProviderType -> BlockRepr -> IO ()
 mkRecord ty rootPath name block = do
-  let recordPath = rootPath </> Turtle.fromText (name <> ".dhall")
+  let recordPath = rootPath </> unpack (name <> ".dhall")
   let record =
         Dhall.Let
           (Dhall.makeBinding "type" (mkBlockFields block)) $
@@ -208,24 +232,33 @@ opts =
         <> Opt.header ("dhall-terraform-libgen :: v" <> showVersion version)
     )
 
+catchExceptionOrContinue :: (Text -> ProviderSchemaRepr -> IO(Map Text SchemaRepr)) -> Text -> ProviderSchemaRepr -> String -> IO(Map Text SchemaRepr)
+catchExceptionOrContinue getSomething providerName doc schemaFilePath =
+  catch (getSomething providerName doc)
+    (\(e :: BadDataException) ->
+      error ("Error! " ++ show e ++ " \nError while reading: " ++ show schemaFilePath))
+
 main :: IO ()
 main = do
   parsedOpts <- Opt.execParser opts
 
-  let outputDir = Turtle.fromText $ pack $ optOutputDir parsedOpts
+  let outputDir = unpack $ pack $ optOutputDir parsedOpts
       providerName = pack $ optProviderName parsedOpts
-      mainDir = outputDir </> Turtle.fromText providerName
-      providerDir = mainDir </> Turtle.fromText "provider"
-      resourcesDir = mainDir </> Turtle.fromText "resources"
-      dataSourcesDir = mainDir </> Turtle.fromText "data_sources"
+      mainDir = outputDir </> unpack providerName
+      providerDir = mainDir </> unpack "provider"
+      resourcesDir = mainDir </> unpack "resources"
+      dataSourcesDir = mainDir </> unpack "data_sources"
       schema_generator = uncurry (uncurry generate)
 
   doc <- readSchemaFile (optSchemaFile parsedOpts)
+  let schemaFileName = optSchemaFile parsedOpts
+
+  [provider, resources, dataSources] <- mapM (\getFunction -> catchExceptionOrContinue getFunction providerName doc schemaFileName) [getProvider, getResources, getDataSources]
 
   let generateDirs =
-        [ ((TFProvider, providerDir), getProvider providerName doc),
-          ((TFResource, resourcesDir), getResources providerName doc),
-          ((TFData, dataSourcesDir), getDataSources providerName doc)
+        [ ((TFProvider, providerDir), provider),
+          ((TFResource, resourcesDir), resources),
+          ((TFData, dataSourcesDir), dataSources)
         ]
 
   mapConcurrently_ schema_generator generateDirs
